@@ -1,0 +1,116 @@
+一、基本知识
+
+  1. bootloader加载完APP后，从esp-idf/components/esp_system/port/cpu_start.c中的call_start_cpu0启动程序
+    它里面通过ets_set_appcpu_boot_addr((uint32_t)call_start_cpu1)启动另一内核CPU1
+  2. 这个程序是谁指定的呢，其实是链接文件esp-idf/components/esp_system/ld/sections.ld.in指定的，它里面开头有一条指令ENTRY(call_start_cpu0);即指定入口函数
+  3. 在链接文件中可以看到，它指定了各section或data的ROM和RAM位置，设定它们的名称和占用的空间长度。
+    注意，内存地址实际是在同目录下的memory.ld.in指定的。
+  4. 在程序中定义的某些函数或变量如果指定section，在链接时，就会被链接到相应的地址。
+  5. ESP32中断的向量表地址是由函数cpu_hal_set_vecbase(const void* addr)指定的，这个是向量表的起始地址。
+    在APP中，例程调用是cpu_hal_set_vecbase(&_vector_table)，它在call_start_cpu0和call_start_cpu1都被调用；
+    其中_vector_table被设定为sections.ld.in中iram0_0_seg的开始地址。
+    从sections.ld.in的.iram0.vectors段可以看出，里面每个名称KEEP(*(.*.text))都分别指定了间隔，这与ESP32的xtensa架构有关，当发生中断时，不同级别的中断会到相应的名称下执行入口函数。
+    注意，_vector_table可以指向其它地址.
+  6. esp32有71个中断源，其中GPIO_INTERRUPT_PRO 和 GPIO_INTERRUPT_PRO_NMI 只可以分配给 PRO_CPU，GPIO_INTERRUPT_APP 和 GPIO_INTERRUPT_APP_NMI 只可以分配给 APP_CPU；
+    其它中断源都可以任意分配给两个CPU中的任意一个CPU的外部中断上。 CPU有32个中断，有26个外部中断和6个内部中断.
+  7.xtensa架构的每个中断对应的级别是不可更改的，它们存放在数组const unsigned char Xthal_intlevel[XTHAL_MAX_INTERRUPTS]中。
+
+二、中断过程以及中断配置
+
+  1.首先，在data区定义一个表，用来存放中断指针和参数的：
+    .data
+    .global yInterruptTable
+    .align  8
+yInterruptTable:
+    .set    i, 0
+    .rept   XCHAL_NUM_INTERRUPTS * CPU_TOTAL_NUM
+    .word   xtUnhandledInterrupt      /* handler address               */
+    .word   i                         /* handler arg (default: intnum) */
+    .set    i, i+1
+    .endr
+    这里使用一个默认的指针xtUnhandledInterrupt填充它，参数就是序号i
+    
+  2.对这个表赋值自己定义的中断例程：
+    yInterruptTable[0][13].handler = myIntFun;
+    yInterruptTable[0][13].arg = myIntArg;
+    以上实际上是为data区一个数组赋值而已
+    
+  3.在ram区指定一个区域用来做中断入口和跳转，这就要用链接文件来实现：
+    1>.先定义一段内存，名为iram_seg，属性为RWX（可读可写可改），启始地址设为0x40080400。
+      这里为啥要比0x40080000多0x400，是因为APP中断向量表就在这里，所以bootloader要跳过1K的空间，以免被APP中断向量盖住。
+      MEMORY
+      {
+        iram_seg (RWX) :                  org = 0x40080400, len = 0xfc00
+      }
+    2>.用一定间距给这段内存划分出不同的名称：
+      .iram.text :
+      {
+        _iram_start = ABSOLUTE(.);
+        bootloader_vector_table = ABSOLUTE(.);
+        /* Vectors according to builds/RF-2015.2-win32/esp108_v1_2_s5_512int_2/config.html */
+        . = 0x0;
+        KEEP(*(.WindowVectors.text));
+        . = 0x180;
+        KEEP(*(.Level2InterruptVector.text));
+        . = 0x1c0;
+        KEEP(*(.Level3InterruptVector.text));
+        . = 0x200;
+        KEEP(*(.Level4InterruptVector.text));
+        . = 0x240;
+        KEEP(*(.Level5InterruptVector.text));
+        ...
+      }
+      注意，这些间距与xtensa架构有关，是确定的，不能任意取值
+      名称取得要知道其用途，调用cpu_hal_set_vecbase(&bootloader_vector_table）后，发生中断，CPU就会从这个段内存指定的间距上，找到相应级别的中断入口函数地址。
+      因此名字就取成像上面这样，表示各级别中断入口地址就在这。
+    3>编写相应中断级别入口函数，这里使用汇编写一个级别为2的中断入口函数：
+      .begin      literal_prefix .Level2InterruptVector
+      .section    .Level2InterruptVector.text, "ax"
+      .global     _Level2Vector
+      .type       _Level2Vector,@function
+      .align      4
+  _Level2Vector:
+      wsr     a0, EXCSAVE_2                   /* preserve a0 */
+      call0   _xt_medint2                     /* load interrupt handler */
+      /* never returns here - call0 is used as a jump (see note at top) */
+      .end        literal_prefix
+      可见，由于Level2InterruptVector.text所在空间有限，所以，入口函数就只保存A0,以及跳转到_xt_medint2。
+    4>在ram1（定义在通用内存上）中编写真正的中断入口函数：
+      .section .iram1,"ax"
+      .type       _xt_medint2,@function
+      .align      4
+  _xt_medint2:
+      mov     a0, sp
+      addi    sp, sp, -XT_STK_FRMSZ
+      ...
+      dispatch_c_isr 2 XCHAL_INTLEVEL2_MASK
+      可见，入口函数主要是保存现场，然后调用宏dispatch_c_isr分发中断级别为2的例程
+    5>dispatch_c_isr定义如下：
+      .macro  dispatch_c_isr    level  mask
+  .L_xt_user_int_&level&:
+      rsr     a2, INTENABLE
+      rsr     a3, INTERRUPT
+      movi    a4, \mask
+      ...
+      movi    a4, yInterruptTable
+      addx8   a3, a3, a4
+      ...
+      它主要就是根据当前的中断号，从yInterruptTable取出相应的指针和参数，调用这个指针，也即用户为该中断自定义的中断处理函数
+      
+  4.将中断源分配到指定的CPU的外中断上：
+    intr_matrix_set(cpu_id,source,intr_number);
+    其中，cpu_id即当前CPU的编号，从cpu_hal_get_core_id()获取；
+    source就是外设的中断源
+    intr_number为0到31对应1到32的中断编号，不过要注意，要使用可用的外部中断号，在手册中有指定。
+    
+  5.使能中断：
+    interrupt_controller_hal_enable_interrupts(1 << intr_number);
+    这里实际上最后会调用xt_ints_on(1 << intr_number);
+    
+  6.失能中断：
+    interrupt_controller_hal_disable_interrupts(1 << intr_number);
+    这里实际上最后会调用xt_ints_off(1 << intr_number);
+    由于将中断分配到内部中断也可以使其失效，所以，也可以intr_matrix_set(cpu_id,source,6);其中6号中断就是一个内部中断。
+    
+  7. 当中断源发生中断时，会跳到分配给它的CPU中断上，CPU中断根据中断级别，从向量表_vector_table找到对应的入口函数；
+    入口函数根据中断号查找注册在指定空间yInterruptTable中的函数指针，跳转执行指针对应的例程。
